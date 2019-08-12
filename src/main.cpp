@@ -28,8 +28,11 @@ template <int dim, typename number>
 class Wrapper
 {
 public:
-  Wrapper(MatrixFree<dim, number> &mf, AffineConstraints<double> &constraints)
+  Wrapper(MatrixFree<dim, number> &  mf,
+          MatrixFree<dim, number> &  mf_plain,
+          AffineConstraints<double> &constraints)
     : mf(mf)
+    , mf_plain(mf_plain)
     , constraints(constraints)
   {}
 
@@ -53,9 +56,6 @@ public:
         fe_eval.reinit(cell);
         fe_eval.read_dof_values(src);
 
-        for (unsigned int i = 0; i < fe_eval.dofs_per_cell; ++i)
-          std::cout << fe_eval.begin_dof_values()[i] << std::endl;
-
         fe_eval.evaluate(false, true, false);
         for (unsigned int q = 0; q < fe_eval.n_q_points; ++q)
           fe_eval.submit_gradient(fe_eval.get_gradient(q), q);
@@ -72,26 +72,29 @@ public:
   }
 
   void
-  compute_diag_local(const MatrixFree<dim, number> &             data,
-                     LinearAlgebra::distributed::Vector<number> &dst,
-                     const LinearAlgebra::distributed::Vector<number> & /*src*/,
-                     const std::pair<unsigned int, unsigned int> &cell_range) const
+  compute_diag_local(const MatrixFree<dim, number> &                   data,
+                     LinearAlgebra::distributed::Vector<number> &      dst,
+                     const LinearAlgebra::distributed::Vector<number> &src,
+                     const std::pair<unsigned int, unsigned int> &     cell_range) const
   {
     const bool is_mg = false;
-    const bool is_dg = (data.get_dof_handler() .get_fe().dofs_per_vertex == 0);
-    
+    const bool is_dg = (data.get_dof_handler().get_fe().dofs_per_vertex == 0);
+
     FEEvaluation<dim, degree, degree + 1, 1, number> fe_eval(data);
+    FEEvaluation<dim, degree, degree + 1, 1, number> fe_eval_plain(mf_plain);
 
     for (unsigned int cell = cell_range.first; cell < cell_range.second; ++cell)
       {
         fe_eval.reinit(cell);
+        fe_eval_plain.reinit(cell);
+
         AlignedVector<VectorizedArray<number>> diagonal(fe_eval.dofs_per_cell,
                                                         make_vectorized_array<number>(0.0));
 
         for (unsigned int i = 0; i < fe_eval.dofs_per_cell; ++i)
           {
             for (unsigned int j = 0; j < fe_eval.dofs_per_cell; ++j)
-              fe_eval.begin_dof_values()[j] = VectorizedArray<number>();
+              fe_eval.begin_dof_values()[j] = make_vectorized_array<number>(0.0);
 
             for (unsigned int v = 0; v < data.n_components_filled(cell); v++)
               {
@@ -136,15 +139,57 @@ public:
             for (unsigned int q = 0; q < fe_eval.n_q_points; ++q)
               fe_eval.submit_gradient(fe_eval.get_gradient(q), q);
             fe_eval.integrate(false, true);
-            diagonal[i] = fe_eval.begin_dof_values()[i];
+
+            VectorizedArray<number> temp = 0.0;
+
+            for (unsigned int v = 0; v < data.n_components_filled(cell); v++)
+              {
+                auto cell_v = data.get_cell_iterator(cell, v);
+
+                std::vector<types::global_dof_index> dof_indices(fe_eval.dofs_per_cell);
+                if (is_mg)
+                  cell_v->get_mg_dof_indices(dof_indices);
+                else
+                  cell_v->get_dof_indices(dof_indices);
+
+                if (!is_dg)
+                  {
+                    // in the case of CG: shape functions are not ordered
+                    // lexicographically see
+                    // (https://www.dealii.org/8.5.1/doxygen/deal.II/classFE__Q.html)
+                    // so we have to fix the order
+                    auto temp = dof_indices;
+                    for (unsigned int j = 0; j < dof_indices.size(); j++)
+                      dof_indices[j] = temp[data.get_shape_info().lexicographic_numbering[j]];
+                  }
+
+                if (!constraints.is_constrained(dof_indices[i]))
+                  {
+                    temp = fe_eval.begin_dof_values()[i][v];
+
+                    for (unsigned int ii = 0; ii < dof_indices.size(); ii++)
+                      {
+                        if (!constraints.is_constrained(dof_indices[ii]))
+                          continue;
+                        auto &cs = *constraints.get_constraint_entries(dof_indices[ii]);
+                        for (auto c : cs)
+                          {
+                            if (c.first == dof_indices[i])
+                              temp += fe_eval.begin_dof_values()[ii][v] * c.second;
+                          }
+                      }
+                  }
+              }
+            diagonal[i] = temp;
           }
-        for (unsigned int i = 0; i < fe_eval.dofs_per_cell; ++i)
-          fe_eval.begin_dof_values()[i] = diagonal[i];
-        fe_eval.distribute_local_to_global(dst);
+        for (unsigned int i = 0; i < fe_eval_plain.dofs_per_cell; ++i)
+          fe_eval_plain.begin_dof_values()[i] = diagonal[i];
+        fe_eval_plain.distribute_local_to_global(dst);
       }
   }
 
   MatrixFree<dim, number> &  mf;
+  MatrixFree<dim, number> &  mf_plain;
   AffineConstraints<double> &constraints;
 };
 
@@ -206,22 +251,26 @@ main()
     AffineConstraints<double> constraints;
     std::vector<bool>         lines = {false, true, true, true};
     constraints.add_lines(lines);
-    constraints.add_entry(1, 0, 0.25);
+    constraints.add_entry(1, 0, 0.75);
     constraints.close();
     constraints.print(std::cout);
     fu(constraints);
-    
+
     typename MatrixFree<dim, double>::AdditionalData additional_data;
     additional_data.tasks_parallel_scheme = MatrixFree<dim, double>::AdditionalData::none;
     additional_data.mapping_update_flags =
       (update_values | update_gradients | update_JxW_values | update_quadrature_points);
     MatrixFree<dim, double> mf;
     mf.reinit(dof_handler, constraints, QGauss<1>(degree + 1), additional_data);
-    Wrapper<dim, double>                       w(mf, constraints);
+    MatrixFree<dim, double>   mf_plain;
+    AffineConstraints<double> constraints_empty;
+    mf_plain.reinit(dof_handler, constraints_empty, QGauss<1>(degree + 1), additional_data);
+    Wrapper<dim, double>                       w(mf, mf_plain, constraints);
     LinearAlgebra::distributed::Vector<double> src, dst, diag;
     mf.initialize_dof_vector(src);
     mf.initialize_dof_vector(dst);
     mf.initialize_dof_vector(diag);
+    diag   = 0.0;
     src[0] = 1.0;
 
     w.vmult(dst, src);
